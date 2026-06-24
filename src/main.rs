@@ -69,6 +69,9 @@ mod raw {
     // 페이서 스레드 → UI 스레드 프레임 신호 (WM_APP 범위, 일반 우선순위라 굶지 않음)
     pub const WM_APP_FRAME: u32 = 0x8000 + 1;
 
+    pub const SM_CXSCREEN: i32 = 0; // 주 모니터 가로 px
+    pub const SM_CYSCREEN: i32 = 1; // 주 모니터 세로 px
+
     #[link(name = "user32")]
     extern "system" {
         pub fn RegisterRawInputDevices(p: *const RawInputDevice, num: u32, size: u32) -> i32;
@@ -80,6 +83,7 @@ mod raw {
             hdr_size: u32,
         ) -> u32;
         pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn GetSystemMetrics(index: i32) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -91,10 +95,11 @@ mod raw {
 
 // ───────────────────────────── 상수/색상 ─────────────────────────────
 // 감도 모델: 게임처럼 "1카운트당 회전 각도(yaw×감도)"를 화면 픽셀로 투영한다.
-//   pixels_per_count = sens × yaw × (focal × π/180) × speed_mult
-//   focal = (에임폭/2) / tan(FOV/2)  → 화면 중앙 기준 °당 픽셀
-// 이렇게 하면 cm/360 이 게임과 동일하게 맞춰져 eDPI 연습이 실제로 의미를 가진다.
-const HFOV_DEG: f64 = 103.0; // 수평 시야각(에임 영역이 나타내는 각도) — KovaaK/CS 류 기본값
+//   pixels_per_count = sens × yaw × px_per_deg × speed_mult
+// 중요: px_per_deg 는 작은 에임 영역이 아니라 **사용자 모니터 전체**의 픽셀/° 여야
+// 게임 손맛이 맞는다(손은 모니터 픽셀 밀도에 길들여져 있음). 모니터 해상도(GetSystemMetrics)와
+// 게임 수직 FOV로 수평 FOV를 구해 px_per_deg = 화면가로 / 수평FOV 로 계산한다.
+const VFOV_DEG: f64 = 103.0; // 게임 수직 시야각 (오버워치 기본 103)
 const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
 // 페이서 스레드가 DwmFlush 실패 시 쓰는 폴백 간격(약 144Hz)
 const FALLBACK_FRAME: Duration = Duration::from_micros(6_944);
@@ -666,9 +671,11 @@ impl App {
             max_targets: parse_f64(&self.e_max).unwrap_or(4.0).clamp(1.0, 50.0) as usize,
         };
 
-        // focal = (에임폭/2) / tan(FOV/2) → 화면 중앙 기준 픽셀/°
-        let focal = (rc.right as f64 / 2.0) / (HFOV_DEG * 0.5 * DEG2RAD).tan();
-        let px_per_deg = focal * DEG2RAD;
+        // 사용자 모니터의 픽셀/° (게임 손맛 기준). 모니터 해상도 + 수직 FOV → 수평 FOV.
+        let sw = unsafe { raw::GetSystemMetrics(raw::SM_CXSCREEN) }.max(1) as f64;
+        let sh = unsafe { raw::GetSystemMetrics(raw::SM_CYSCREEN) }.max(1) as f64;
+        let hfov_deg = 2.0 * ((VFOV_DEG * 0.5 * DEG2RAD).tan() * (sw / sh)).atan() / DEG2RAD;
+        let px_per_deg = sw / hfov_deg;
 
         {
             let mut st = self.state.borrow_mut();
