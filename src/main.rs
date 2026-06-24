@@ -139,8 +139,8 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            sens: 2.0,
-            yaw: 0.022,
+            sens: 5.0,    // 오버워치 기본(4~6 중간)
+            yaw: 0.0066,  // 오버워치 yaw
             speed: 1.0,
             radius: 28,
             spawn_ms: 850,
@@ -325,12 +325,12 @@ impl App {
         let _hdr1 = lbl(&wnd, "설정", LX, 12);
         let _l1 = lbl(&wnd, "마우스 DPI", LX, 42);
         let e_dpi = edit(&wnd, "800", 42);
-        let _l2 = lbl(&wnd, "감도 (sensitivity)", LX, 70);
-        let e_sens = edit(&wnd, "2.0", 70);
+        let _l2 = lbl(&wnd, "감도 (오버워치 인게임)", LX, 70);
+        let e_sens = edit(&wnd, "5.0", 70);
         let _l3 = lbl(&wnd, "게임 yaw (°/카운트)", LX, 98);
-        let e_yaw = edit(&wnd, "0.022", 98);
+        let e_yaw = edit(&wnd, "0.0066", 98);
         let _l4 = lbl(&wnd, "eDPI (DPI × 감도)", LX, 126);
-        let l_edpi = val(&wnd, "1600", 126);
+        let l_edpi = val(&wnd, "4000", 126);
         let _l5 = lbl(&wnd, "cm/360 (≈게임 체감)", LX, 152);
         let l_cm360 = val(&wnd, "—", 152);
         let _l6 = lbl(&wnd, "커서 속도 배율", LX, 180);
@@ -392,8 +392,8 @@ impl App {
         let _hint = gui::Label::new(
             &wnd,
             gui::LabelOpts {
-                text: "초록 링으로 조준 후 좌클릭. cm/360 을 본인 게임 값에 맞추면 감도가 동일해집니다 \
-                       (게임 yaw: CS/Apex 0.022, 발로란트 0.07, 옵치 0.0066). Windows '포인터 정확도 향상'은 꺼두세요.",
+                text: "오버워치 기준(yaw 0.0066, DPI 800)으로 설정됨. 캐릭터별로 '감도' 칸만 4.0~6.0 으로 \
+                       바꿔 다시 시작하세요. Windows '포인터 정확도 향상'(마우스 가속)은 꺼두세요.",
                 position: (LX, 598),
                 size: (300, 72),
                 ..Default::default()
@@ -961,11 +961,11 @@ fn resolve_dpi(e: &gui::Edit) -> f64 {
 }
 
 fn resolve_sens(e: &gui::Edit) -> f64 {
-    parse_f64(e).unwrap_or(2.0).clamp(0.01, 100.0)
+    parse_f64(e).unwrap_or(5.0).clamp(0.01, 100.0)
 }
 
 fn resolve_yaw(e: &gui::Edit) -> f64 {
-    parse_f64(e).unwrap_or(0.022).clamp(0.0001, 10.0)
+    parse_f64(e).unwrap_or(0.0066).clamp(0.0001, 10.0)
 }
 
 fn main() {
