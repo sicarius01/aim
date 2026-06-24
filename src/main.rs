@@ -14,7 +14,9 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use winsafe::{self as w, co, gui, prelude::*};
 use winsafe::{COLORREF, HBRUSH, HPEN, POINT, RECT, SIZE};
@@ -64,6 +66,9 @@ mod raw {
         pub mouse: RawMouse,
     }
 
+    // 페이서 스레드 → UI 스레드 프레임 신호 (WM_APP 범위, 일반 우선순위라 굶지 않음)
+    pub const WM_APP_FRAME: u32 = 0x8000 + 1;
+
     #[link(name = "user32")]
     extern "system" {
         pub fn RegisterRawInputDevices(p: *const RawInputDevice, num: u32, size: u32) -> i32;
@@ -74,15 +79,25 @@ mod raw {
             size: *mut u32,
             hdr_size: u32,
         ) -> u32;
+        pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        // 다음 DWM 컴포지션(수직동기)까지 블록. 주사율마다 1회 반환 → vsync 페이싱.
+        pub fn DwmFlush() -> i32; // HRESULT, S_OK == 0
     }
 }
 
 // ───────────────────────────── 상수/색상 ─────────────────────────────
-const TIMER_ID: usize = 1;
-const TICK_MS: u32 = 16; // ≈ 62 fps
-
-// eDPI를 픽셀/카운트로 환산하는 기준값. eDPI == REF_EDPI 이고 배율 1.0 이면 1카운트 = 1px.
-const REF_EDPI: f64 = 3200.0;
+// 감도 모델: 게임처럼 "1카운트당 회전 각도(yaw×감도)"를 화면 픽셀로 투영한다.
+//   pixels_per_count = sens × yaw × (focal × π/180) × speed_mult
+//   focal = (에임폭/2) / tan(FOV/2)  → 화면 중앙 기준 °당 픽셀
+// 이렇게 하면 cm/360 이 게임과 동일하게 맞춰져 eDPI 연습이 실제로 의미를 가진다.
+const HFOV_DEG: f64 = 103.0; // 수평 시야각(에임 영역이 나타내는 각도) — KovaaK/CS 류 기본값
+const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
+// 페이서 스레드가 DwmFlush 실패 시 쓰는 폴백 간격(약 144Hz)
+const FALLBACK_FRAME: Duration = Duration::from_micros(6_944);
 
 const C_PANEL: (u8, u8, u8) = (37, 37, 38); // #252526  사이드바
 const C_EDITOR: (u8, u8, u8) = (30, 30, 30); // #1E1E1E  에디터(에임 영역)
@@ -108,10 +123,12 @@ fn leak_brush(c: (u8, u8, u8)) -> HBRUSH {
 }
 
 // ───────────────────────────── 상태 ─────────────────────────────
+// 참고: DPI는 시뮬레이션(ppc)에 직접 쓰이지 않는다. 원시 카운트가 이미 하드웨어 DPI를
+// 반영하기 때문(게임 eDPI 불변성과 동일). DPI는 eDPI/cm360 표시 계산에만 쓴다.
 #[derive(Clone, Copy)]
 struct Settings {
-    dpi: f64,
     sens: f64,
+    yaw: f64, // °/카운트 @ 감도 1.0 (게임 상수: CS/Apex 0.022, 발로란트 0.07, 옵치 0.0066)
     speed: f64,
     radius: i32,
     spawn_ms: u64,
@@ -122,8 +139,8 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            dpi: 800.0,
-            sens: 4.0,
+            sens: 2.0,
+            yaw: 0.022,
             speed: 1.0,
             radius: 28,
             spawn_ms: 850,
@@ -161,6 +178,7 @@ struct State {
     aim_w: i32,
     aim_h: i32,
     last_spawn: Option<Instant>,
+    px_per_deg: f64, // 시작 시 에임폭+FOV로 계산
     rng: u64,
     stats: Stats,
     tick: u64,
@@ -184,6 +202,7 @@ impl State {
             aim_w: 1,
             aim_h: 1,
             last_spawn: None,
+            px_per_deg: 1.0,
             rng: seed,
             stats: Stats::default(),
             tick: 0,
@@ -209,6 +228,7 @@ struct App {
 
     e_dpi: gui::Edit,
     e_sens: gui::Edit,
+    e_yaw: gui::Edit,
     e_speed: gui::Edit,
     e_radius: gui::Edit,
     e_spawn: gui::Edit,
@@ -216,6 +236,7 @@ struct App {
     e_max: gui::Edit,
 
     l_edpi: gui::Label,
+    l_cm360: gui::Label,
     btn_start: gui::Button,
     btn_reset: gui::Button,
 
@@ -228,6 +249,10 @@ struct App {
     l_status: gui::Label,
 
     state: Rc<RefCell<State>>,
+    // 페이서 스레드 ↔ UI 스레드 공유 플래그 (스레드 안전)
+    session_active: Arc<AtomicBool>, // 연습 진행 중에만 프레임 신호
+    alive: Arc<AtomicBool>,          // 앱 종료 시 페이서 스레드 정지
+    frame_pending: Arc<AtomicBool>,  // 미처리 프레임 1개로 제한(큐 적체 방지)
 }
 
 impl App {
@@ -300,27 +325,31 @@ impl App {
         let _hdr1 = lbl(&wnd, "설정", LX, 12);
         let _l1 = lbl(&wnd, "마우스 DPI", LX, 42);
         let e_dpi = edit(&wnd, "800", 42);
-        let _l2 = lbl(&wnd, "감도 (sensitivity)", LX, 72);
-        let e_sens = edit(&wnd, "4.0", 72);
-        let _l3 = lbl(&wnd, "eDPI  (DPI × 감도)", LX, 102);
-        let l_edpi = val(&wnd, "3200", 102);
-        let _l4 = lbl(&wnd, "커서 속도 배율", LX, 132);
-        let e_speed = edit(&wnd, "1.0", 132);
+        let _l2 = lbl(&wnd, "감도 (sensitivity)", LX, 70);
+        let e_sens = edit(&wnd, "2.0", 70);
+        let _l3 = lbl(&wnd, "게임 yaw (°/카운트)", LX, 98);
+        let e_yaw = edit(&wnd, "0.022", 98);
+        let _l4 = lbl(&wnd, "eDPI (DPI × 감도)", LX, 126);
+        let l_edpi = val(&wnd, "1600", 126);
+        let _l5 = lbl(&wnd, "cm/360 (≈게임 체감)", LX, 152);
+        let l_cm360 = val(&wnd, "—", 152);
+        let _l6 = lbl(&wnd, "커서 속도 배율", LX, 180);
+        let e_speed = edit(&wnd, "1.0", 180);
 
-        let _l5 = lbl(&wnd, "타깃 크기 (반지름 px)", LX, 172);
-        let e_radius = edit(&wnd, "28", 172);
-        let _l6 = lbl(&wnd, "생성 주기 (ms)", LX, 202);
-        let e_spawn = edit(&wnd, "850", 202);
-        let _l7 = lbl(&wnd, "타깃 수명 (ms)", LX, 232);
-        let e_life = edit(&wnd, "1100", 232);
-        let _l8 = lbl(&wnd, "최대 동시 타깃", LX, 262);
-        let e_max = edit(&wnd, "4", 262);
+        let _l7 = lbl(&wnd, "타깃 크기 (반지름 px)", LX, 212);
+        let e_radius = edit(&wnd, "28", 212);
+        let _l8 = lbl(&wnd, "생성 주기 (ms)", LX, 240);
+        let e_spawn = edit(&wnd, "850", 240);
+        let _l9 = lbl(&wnd, "타깃 수명 (ms)", LX, 268);
+        let e_life = edit(&wnd, "1100", 268);
+        let _l10 = lbl(&wnd, "최대 동시 타깃", LX, 296);
+        let e_max = edit(&wnd, "4", 296);
 
         let btn_start = gui::Button::new(
             &wnd,
             gui::ButtonOpts {
                 text: "시작 (F2)",
-                position: (LX, 300),
+                position: (LX, 330),
                 width: 170,
                 height: 30,
                 ..Default::default()
@@ -330,43 +359,43 @@ impl App {
             &wnd,
             gui::ButtonOpts {
                 text: "기록 초기화",
-                position: (LX + 184, 300),
+                position: (LX + 184, 330),
                 width: 100,
                 height: 30,
                 ..Default::default()
             },
         );
 
-        let _hdr2 = lbl(&wnd, "기록", LX, 348);
-        let _s1 = lbl(&wnd, "점수", LX, 376);
-        let l_score = val(&wnd, "0", 376);
-        let _s2 = lbl(&wnd, "명중 (놓침·빗맞힘)", LX, 404);
-        let l_hits = val(&wnd, "0", 404);
-        let _s3 = lbl(&wnd, "클릭 정확도", LX, 432);
-        let l_acc = val(&wnd, "0.0%", 432);
-        let _s4 = lbl(&wnd, "평균 반응속도", LX, 460);
-        let l_react = val(&wnd, "0 ms", 460);
-        let _s5 = lbl(&wnd, "최고 반응속도", LX, 488);
-        let l_best = val(&wnd, "0 ms", 488);
-        let _s6 = lbl(&wnd, "평균 중앙 정확도", LX, 516);
-        let l_center = val(&wnd, "0.0%", 516);
+        let _hdr2 = lbl(&wnd, "기록", LX, 374);
+        let _s1 = lbl(&wnd, "점수", LX, 400);
+        let l_score = val(&wnd, "0", 400);
+        let _s2 = lbl(&wnd, "명중 (놓침·빗맞힘)", LX, 426);
+        let l_hits = val(&wnd, "0", 426);
+        let _s3 = lbl(&wnd, "클릭 정확도", LX, 452);
+        let l_acc = val(&wnd, "0.0%", 452);
+        let _s4 = lbl(&wnd, "평균 반응속도", LX, 478);
+        let l_react = val(&wnd, "0 ms", 478);
+        let _s5 = lbl(&wnd, "최고 반응속도", LX, 504);
+        let l_best = val(&wnd, "0 ms", 504);
+        let _s6 = lbl(&wnd, "평균 중앙 정확도", LX, 530);
+        let l_center = val(&wnd, "0.0%", 530);
 
         let l_status = gui::Label::new(
             &wnd,
             gui::LabelOpts {
                 text: "정지됨. [시작] 또는 F2.  진행 중엔 ESC로 정지.",
-                position: (LX, 556),
-                size: (300, 36),
+                position: (LX, 562),
+                size: (300, 32),
                 ..Default::default()
             },
         );
         let _hint = gui::Label::new(
             &wnd,
             gui::LabelOpts {
-                text: "초록 링으로 조준 후 좌클릭. 정확한 eDPI 연습을 위해 Windows의 \
-                       '포인터 정확도 향상'을 꺼두는 것을 권장합니다.",
-                position: (LX, 600),
-                size: (300, 60),
+                text: "초록 링으로 조준 후 좌클릭. cm/360 을 본인 게임 값에 맞추면 감도가 동일해집니다 \
+                       (게임 yaw: CS/Apex 0.022, 발로란트 0.07, 옵치 0.0066). Windows '포인터 정확도 향상'은 꺼두세요.",
+                position: (LX, 598),
+                size: (300, 72),
                 ..Default::default()
             },
         );
@@ -376,12 +405,14 @@ impl App {
             aim,
             e_dpi,
             e_sens,
+            e_yaw,
             e_speed,
             e_radius,
             e_spawn,
             e_life,
             e_max,
             l_edpi,
+            l_cm360,
             btn_start,
             btn_reset,
             l_score,
@@ -392,6 +423,9 @@ impl App {
             l_center,
             l_status,
             state: Rc::new(RefCell::new(State::new())),
+            session_active: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(true)),
+            frame_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -439,8 +473,39 @@ impl App {
             if !ok {
                 me.set_status("Raw input 등록 실패 — 마우스 추적 불가. 앱을 재시작해 보세요.");
             }
-            let _ = me.wnd.hwnd().SetTimer(TIMER_ID, TICK_MS, None);
             me.update_edpi();
+
+            // vsync 페이서 스레드 기동: DwmFlush로 vblank까지 잠들었다가(=busy-wait 아님)
+            // 매 vblank마다 UI 스레드에 프레임 메시지를 보낸다. → 주사율 그대로 렌더, CPU 거의 0.
+            let hwnd_usize = hwnd_ptr as usize;
+            let alive = me.alive.clone();
+            let active = me.session_active.clone();
+            let pending = me.frame_pending.clone();
+            std::thread::spawn(move || {
+                while alive.load(Ordering::Relaxed) {
+                    let hr = unsafe { raw::DwmFlush() };
+                    if hr != 0 {
+                        // DWM 사용 불가 시 폴백(약 144Hz)
+                        std::thread::sleep(FALLBACK_FRAME);
+                    }
+                    if !alive.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // 진행 중이고 미처리 프레임이 없을 때만 한 장 요청(큐 적체 방지)
+                    if active.load(Ordering::Relaxed)
+                        && !pending.swap(true, Ordering::AcqRel)
+                    {
+                        unsafe {
+                            raw::PostMessageW(
+                                hwnd_usize as *mut c_void,
+                                raw::WM_APP_FRAME,
+                                0,
+                                0,
+                            );
+                        }
+                    }
+                }
+            });
             Ok(0)
         });
 
@@ -452,6 +517,11 @@ impl App {
         });
         let me = self.clone();
         self.e_sens.on().en_change(move || {
+            me.update_edpi();
+            Ok(())
+        });
+        let me = self.clone();
+        self.e_yaw.on().en_change(move || {
             me.update_edpi();
             Ok(())
         });
@@ -482,10 +552,20 @@ impl App {
             Ok(res)
         });
 
-        // 타이머 틱: 생성/소멸/리페인트
+        // vsync 프레임 신호(페이서 스레드가 매 vblank에 보냄) → 한 프레임 진행+렌더.
+        // WM_APP 범위라 일반 우선순위 → WM_INPUT 폭주에도 굶지 않는다.
         let me = self.clone();
-        self.wnd.on().wm_timer(TIMER_ID, move || {
-            me.on_tick()?;
+        let wm_frame = unsafe { co::WM::from_raw(raw::WM_APP_FRAME) };
+        self.wnd.on().wm(wm_frame, move |_| {
+            me.frame_pending.store(false, Ordering::Release);
+            me.frame();
+            Ok(0)
+        });
+
+        // 앱 종료 시 페이서 스레드 정지
+        let me = self.clone();
+        self.wnd.on().wm_destroy(move || {
+            me.alive.store(false, Ordering::Release);
             Ok(())
         });
 
@@ -532,11 +612,20 @@ impl App {
         });
     }
 
-    // ── eDPI 라벨 ──
+    // ── eDPI / cm·360 표시 ──
     fn update_edpi(&self) {
         // 실제 시뮬레이션에 쓰이는 값(클램프/기본값 포함)과 동일하게 표시
-        let edpi = resolve_dpi(&self.e_dpi) * resolve_sens(&self.e_sens);
-        let _ = self.l_edpi.hwnd().SetWindowText(&format!("{:.0}", edpi));
+        let dpi = resolve_dpi(&self.e_dpi);
+        let sens = resolve_sens(&self.e_sens);
+        let yaw = resolve_yaw(&self.e_yaw);
+        let _ = self.l_edpi.hwnd().SetWindowText(&format!("{:.0}", dpi * sens));
+        // cm/360 = (360 × 2.54) / (DPI × 감도 × yaw)
+        let denom = dpi * sens * yaw;
+        let cm360 = if denom > 0.0 { 360.0 * 2.54 / denom } else { 0.0 };
+        let _ = self
+            .l_cm360
+            .hwnd()
+            .SetWindowText(&format!("{:.1} cm", cm360));
     }
 
     // ── 시작/정지 ──
@@ -568,8 +657,8 @@ impl App {
             .unwrap_or(RECT { left: 0, top: 0, right: 1, bottom: 1 });
 
         let settings = Settings {
-            dpi: resolve_dpi(&self.e_dpi),
             sens: resolve_sens(&self.e_sens),
+            yaw: resolve_yaw(&self.e_yaw),
             speed: parse_f64(&self.e_speed).unwrap_or(1.0).clamp(0.05, 20.0),
             radius: parse_f64(&self.e_radius).unwrap_or(28.0).clamp(6.0, 120.0) as i32,
             spawn_ms: parse_f64(&self.e_spawn).unwrap_or(850.0).clamp(50.0, 10000.0) as u64,
@@ -577,17 +666,23 @@ impl App {
             max_targets: parse_f64(&self.e_max).unwrap_or(4.0).clamp(1.0, 50.0) as usize,
         };
 
+        // focal = (에임폭/2) / tan(FOV/2) → 화면 중앙 기준 픽셀/°
+        let focal = (rc.right as f64 / 2.0) / (HFOV_DEG * 0.5 * DEG2RAD).tan();
+        let px_per_deg = focal * DEG2RAD;
+
         {
             let mut st = self.state.borrow_mut();
             st.settings = settings;
             st.aim_w = rc.right;
             st.aim_h = rc.bottom;
+            st.px_per_deg = px_per_deg;
             st.cx = rc.right as f64 / 2.0;
             st.cy = rc.bottom as f64 / 2.0;
             st.targets.clear();
             st.last_spawn = None;
             st.running = true;
         }
+        self.session_active.store(true, Ordering::Release);
 
         // 커서 숨김 + 에임 영역에 가둠
         w::ShowCursor(false);
@@ -615,6 +710,7 @@ impl App {
             st.running = false;
             st.targets.clear();
         }
+        self.session_active.store(false, Ordering::Release);
         let _ = w::ClipCursor(None);
         w::ShowCursor(true);
         let _ = self.btn_start.hwnd().SetWindowText("시작 (F2)");
@@ -623,14 +719,13 @@ impl App {
     }
 
     // ── Raw input 처리 ──
+    // WM_INPUT은 마우스 HID 리포트마다 1개씩 전달되며 WM_MOUSEMOVE처럼 합쳐지지 않는다.
+    // 즉 모든 이동 이벤트를 받는다. 여기서 가상 커서를 누적시키고, 곧바로 pump()로
+    // (스로틀된) 동기 리페인트를 실행해 빠르게 움직여도 커서가 끊기지 않게 한다.
     fn on_raw_input(&self, lparam: isize) {
-        let mut st = self.state.borrow_mut();
-        if !st.running {
-            return;
-        }
+        // 1) raw 델타 읽기 (상태 borrow 없이)
         let hri = lparam as *mut c_void;
         let hdr = std::mem::size_of::<raw::RawInputHeader>() as u32;
-        // 정렬 보장: RawInput 크기의 정렬된 버퍼에 직접 수신 (마우스 RAWINPUT은 정확히 이 크기)
         let mut ri_buf = std::mem::MaybeUninit::<raw::RawInput>::uninit();
         let mut size = std::mem::size_of::<raw::RawInput>() as u32;
         let got = unsafe {
@@ -646,22 +741,72 @@ impl App {
             return;
         }
         let ri = unsafe { &*ri_buf.as_ptr() };
-        if ri.header.dw_type != raw::RIM_TYPEMOUSE {
+        if ri.header.dw_type != raw::RIM_TYPEMOUSE
+            || ri.mouse.us_flags & raw::MOUSE_MOVE_ABSOLUTE != 0
+        {
             return;
-        }
-        if ri.mouse.us_flags & raw::MOUSE_MOVE_ABSOLUTE != 0 {
-            return; // 절대좌표(원격데스크톱/태블릿)는 무시
         }
         let dx = ri.mouse.l_last_x as f64;
         let dy = ri.mouse.l_last_y as f64;
-        if dx == 0.0 && dy == 0.0 {
+
+        // 2) 가상 커서 누적만 (렌더는 vsync 프레임이 담당 → 입력은 빠르게 소화)
+        let mut st = self.state.borrow_mut();
+        if !st.running {
             return;
         }
-        let edpi = st.settings.dpi * st.settings.sens;
-        let ppc = (edpi / REF_EDPI) * st.settings.speed; // 픽셀/카운트
-        let (w_, h_) = (st.aim_w as f64, st.aim_h as f64);
-        st.cx = (st.cx + dx * ppc).clamp(0.0, w_);
-        st.cy = (st.cy + dy * ppc).clamp(0.0, h_);
+        if dx != 0.0 || dy != 0.0 {
+            // pixels/count = 감도 × yaw(°/카운트) × (focal·π/180) × 배율
+            let ppc = st.settings.sens * st.settings.yaw * st.px_per_deg * st.settings.speed;
+            let (w_, h_) = (st.aim_w as f64, st.aim_h as f64);
+            st.cx = (st.cx + dx * ppc).clamp(0.0, w_);
+            st.cy = (st.cy + dy * ppc).clamp(0.0, h_);
+        }
+    }
+
+    // 한 프레임: 타깃 생성/소멸 전진 + 렌더. vsync 페이서가 매 vblank에 호출한다.
+    fn frame(&self) {
+        let now = Instant::now();
+        let mut do_stats = false;
+        {
+            let mut st = self.state.borrow_mut();
+            if !st.running {
+                return;
+            }
+            // 소멸
+            let life = st.settings.life_ms as u128;
+            let before = st.targets.len();
+            st.targets.retain(|t| t.born.elapsed().as_millis() < life);
+            let expired = before - st.targets.len();
+            if expired > 0 {
+                st.stats.expired += expired as u32;
+                do_stats = true;
+            }
+            // 생성
+            let need = match st.last_spawn {
+                Some(ls) => ls.elapsed().as_millis() >= st.settings.spawn_ms as u128,
+                None => true,
+            };
+            if need && st.targets.len() < st.settings.max_targets {
+                let r = st.settings.radius;
+                let margin = r + 4;
+                let span_w = (st.aim_w - 2 * margin).max(1) as u64;
+                let span_h = (st.aim_h - 2 * margin).max(1) as u64;
+                let rx = margin + (st.next_rand() % span_w) as i32;
+                let ry = margin + (st.next_rand() % span_h) as i32;
+                st.targets.push(Target { x: rx, y: ry, r, born: now });
+                st.last_spawn = Some(now);
+            }
+            st.tick += 1;
+            if st.tick % 30 == 0 {
+                do_stats = true;
+            }
+        }
+        // 동기 렌더 (큐를 거치지 않으므로 WM_INPUT 폭주에도 굶지 않음)
+        let _ = self.aim.hwnd().InvalidateRect(None, false);
+        let _ = self.aim.hwnd().UpdateWindow();
+        if do_stats {
+            self.update_stats();
+        }
     }
 
     // ── 클릭 판정 ──
@@ -702,58 +847,7 @@ impl App {
         }
         self.update_stats();
         let _ = self.aim.hwnd().InvalidateRect(None, false);
-    }
-
-    // ── 타이머 틱 ──
-    fn on_tick(&self) -> w::AnyResult<()> {
-        let mut do_stats = false;
-        {
-            let mut st = self.state.borrow_mut();
-            if !st.running {
-                return Ok(());
-            }
-            let now = Instant::now();
-
-            // 소멸
-            let life = st.settings.life_ms as u128;
-            let before = st.targets.len();
-            st.targets.retain(|t| t.born.elapsed().as_millis() < life);
-            let expired = before - st.targets.len();
-            if expired > 0 {
-                st.stats.expired += expired as u32;
-            }
-
-            // 생성
-            let need = match st.last_spawn {
-                Some(ls) => ls.elapsed().as_millis() >= st.settings.spawn_ms as u128,
-                None => true,
-            };
-            if need && st.targets.len() < st.settings.max_targets {
-                let r = st.settings.radius;
-                let margin = r + 4;
-                let span_w = (st.aim_w - 2 * margin).max(1) as u64;
-                let span_h = (st.aim_h - 2 * margin).max(1) as u64;
-                let rx = margin + (st.next_rand() % span_w) as i32;
-                let ry = margin + (st.next_rand() % span_h) as i32;
-                st.targets.push(Target {
-                    x: rx,
-                    y: ry,
-                    r,
-                    born: now,
-                });
-                st.last_spawn = Some(now);
-            }
-
-            st.tick += 1;
-            if st.tick % 8 == 0 || expired > 0 {
-                do_stats = true;
-            }
-        }
-        self.aim.hwnd().InvalidateRect(None, false)?;
-        if do_stats {
-            self.update_stats();
-        }
-        Ok(())
+        let _ = self.aim.hwnd().UpdateWindow(); // 클릭 즉시 반영
     }
 
     // ── 페인팅 ──
@@ -867,7 +961,11 @@ fn resolve_dpi(e: &gui::Edit) -> f64 {
 }
 
 fn resolve_sens(e: &gui::Edit) -> f64 {
-    parse_f64(e).unwrap_or(4.0).clamp(0.01, 100.0)
+    parse_f64(e).unwrap_or(2.0).clamp(0.01, 100.0)
+}
+
+fn resolve_yaw(e: &gui::Edit) -> f64 {
+    parse_f64(e).unwrap_or(0.022).clamp(0.0001, 10.0)
 }
 
 fn main() {
