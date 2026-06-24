@@ -1,0 +1,11 @@
+[package]
+name = "aim_trainer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winsafe = { version = "0.0.27", features = ["gui"] }
+
+[profile.release]
+opt-level = 3
+lto = true
