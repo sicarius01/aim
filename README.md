@@ -115,6 +115,19 @@ Win32에서 `WM_PAINT`·`WM_TIMER`는 **메시지 큐가 비었을 때만** 생�
 - 입력(`WM_INPUT`)은 매 이벤트마다 가상 커서 위치를 **누적만** 하고(렌더는 프레임이 담당), 라이브러리
   `run_main`(GetMessage 루프)은 그대로 둡니다.
 
+## 코드 구조 (`src/`)
+
+| 모듈 | 책임 |
+|------|------|
+| `main.rs` | 진입점 + 모듈 선언 |
+| `raw.rs` | user32/dwmapi 직접 FFI (raw input, PostMessage, DwmFlush, GetSystemMetrics) |
+| `theme.rs` | 색상 팔레트 + GDI 헬퍼(`rgb`, `leak_brush`) |
+| `model.rs` | 모드/시나리오/설정/타깃/상태 + RNG + 점수 헬퍼 |
+| `patterns.rs` | 트래킹 타깃 이동 패턴(스트레이프/에어/트레이서/파라/겐지) |
+| `persist.rs` | 로컬 최고기록 + CSV 로그 |
+| `render.rs` | 에임 영역 장면 렌더링(이중 버퍼) |
+| `app.rs` | GUI 구성·이벤트 배선·세션·raw input·vsync 프레임 오케스트레이션 |
+
 ## 구현 메모
 
 - `winsafe` 0.0.27에는 raw input 래퍼가 없어 `RegisterRawInputDevices` / `GetRawInputData` /
