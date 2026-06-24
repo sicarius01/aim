@@ -7,7 +7,8 @@
 //   patterns : 트래킹 타깃 이동 패턴(스트레이프/에어/트레이서/파라/겐지)
 //   persist  : 로컬 최고기록 + CSV 로그
 //   render   : 에임 영역 장면 렌더링(이중 버퍼)
-//   app      : GUI 구성·이벤트·세션·raw input·vsync 프레임 오케스트레이션
+//   ui       : 위젯 생성 + 정적 패널 레이아웃
+//   app      : 이벤트 배선·세션·raw input·vsync 프레임 오케스트레이션
 //
 // 렌더: vsync 페이서 스레드(DwmFlush)가 매 vblank 프레임을 그려 주사율대로 부드럽게.
 // 감도: 게임 yaw + 모니터 픽셀/° 로 cm/360을 게임과 맞춰 실제 손맛으로 연습.
@@ -22,6 +23,7 @@ mod persist;
 mod raw;
 mod render;
 mod theme;
+mod ui;
 
 fn main() {
     let app = app::App::new();

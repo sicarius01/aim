@@ -126,7 +126,8 @@ Win32에서 `WM_PAINT`·`WM_TIMER`는 **메시지 큐가 비었을 때만** 생�
 | `patterns.rs` | 트래킹 타깃 이동 패턴(스트레이프/에어/트레이서/파라/겐지) |
 | `persist.rs` | 로컬 최고기록 + CSV 로그 |
 | `render.rs` | 에임 영역 장면 렌더링(이중 버퍼) |
-| `app.rs` | GUI 구성·이벤트 배선·세션·raw input·vsync 프레임 오케스트레이션 |
+| `ui.rs` | 위젯 생성 + 정적 패널 레이아웃 (`Widgets` + `build()`) |
+| `app.rs` | 이벤트 배선·세션·raw input·vsync 프레임 오케스트레이션 |
 
 ## 구현 메모
 
